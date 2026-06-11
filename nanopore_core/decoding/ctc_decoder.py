@@ -114,6 +114,206 @@ def _greedy_decode_batch(
     return decoded_list, confidences
 
 
+def greedy_decode_torch_batch(
+    log_probs: torch.Tensor,
+    lengths: Optional[torch.Tensor] = None,
+    blank: int = BLANK_INDEX,
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """基于 PyTorch 的批量 CTC 贪心解码（GPU 加速）
+    
+    完全在 GPU 上执行 argmax、折叠重复、blank 过滤，
+    仅将最终结果传回 CPU，大幅减少数据传输量。
+    
+    Args:
+        log_probs: (T, B, C) 对数概率张量（时间优先）
+        lengths: (B,) 各序列的有效长度，None 表示全部有效
+        blank: 空白符索引
+        
+    Returns:
+        (labels_list, confidences) 元组
+        - labels_list: 长度为 B 的列表，每个元素是解码后的标签张量
+        - confidences: (B,) 各序列的平均置信度
+    """
+    T, B, C = log_probs.shape
+    device = log_probs.device
+
+    labels = torch.argmax(log_probs, dim=-1)
+    max_probs = torch.max(log_probs, dim=-1).values
+    probs = torch.exp(max_probs)
+
+    labels_list: List[torch.Tensor] = []
+    confidences = torch.zeros(B, dtype=torch.float32, device=device)
+
+    for b in range(B):
+        seq_len = int(lengths[b].item()) if lengths is not None else T
+        if seq_len == 0:
+            labels_list.append(torch.tensor([], dtype=torch.long, device=device))
+            confidences[b] = 0.0
+            continue
+
+        seq_labels = labels[:seq_len, b]
+        seq_probs = probs[:seq_len, b]
+
+        diff_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
+        diff_mask[1:] = seq_labels[1:] != seq_labels[:-1]
+
+        blank_mask = seq_labels != blank
+        valid_mask = diff_mask & blank_mask
+
+        decoded = seq_labels[valid_mask]
+        decoded_probs = seq_probs[valid_mask]
+
+        if len(decoded) > 0:
+            confidences[b] = decoded_probs.mean()
+        else:
+            confidences[b] = 0.0
+
+        labels_list.append(decoded)
+
+    return labels_list, confidences
+
+
+def greedy_decode_torch_vectorized(
+    log_probs: torch.Tensor,
+    lengths: Optional[torch.Tensor] = None,
+    blank: int = BLANK_INDEX,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """完全向量化的批量 CTC 贪心解码（GPU 加速）
+    
+    使用展平 + 段索引的方式，完全消除 batch 维度的 for 循环。
+    返回填充后的标签矩阵及有效长度，适合后续批量处理。
+    
+    Args:
+        log_probs: (T, B, C) 对数概率张量（时间优先）
+        lengths: (B,) 各序列的有效长度
+        blank: 空白符索引
+        
+    Returns:
+        (padded_labels, label_lengths, confidences) 元组
+        - padded_labels: (B, L) 填充后的标签矩阵，L 是最长序列的标签数
+        - label_lengths: (B,) 各序列的实际标签数
+        - confidences: (B,) 各序列的平均置信度
+    """
+    T, B, C = log_probs.shape
+    device = log_probs.device
+
+    labels = torch.argmax(log_probs, dim=-1)
+    max_probs = torch.max(log_probs, dim=-1).values
+    probs = torch.exp(max_probs)
+
+    labels_t = labels.transpose(0, 1).contiguous()
+    probs_t = probs.transpose(0, 1).contiguous()
+
+    diff_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+    diff_mask[:, 1:] = labels_t[:, 1:] != labels_t[:, :-1]
+
+    blank_mask = labels_t != blank
+    valid_mask = diff_mask & blank_mask
+
+    if lengths is not None:
+        len_mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        valid_mask = valid_mask & len_mask
+
+    label_counts = valid_mask.sum(dim=1)
+    max_labels = int(label_counts.max().item()) if label_counts.numel() > 0 else 0
+
+    padded_labels = torch.full(
+        (B, max_labels), blank, dtype=torch.long, device=device
+    )
+    padded_probs = torch.zeros(B, max_labels, dtype=torch.float32, device=device)
+
+    for b in range(B):
+        n = int(label_counts[b].item())
+        if n > 0:
+            idx = valid_mask[b]
+            padded_labels[b, :n] = labels_t[b, idx]
+            padded_probs[b, :n] = probs_t[b, idx]
+
+    confidences = torch.zeros(B, dtype=torch.float32, device=device)
+    valid_batches = label_counts > 0
+    if valid_batches.any():
+        for b in range(B):
+            n = int(label_counts[b].item())
+            if n > 0:
+                confidences[b] = padded_probs[b, :n].mean()
+
+    return padded_labels, label_counts, confidences
+
+
+def torch_labels_to_strings(
+    labels_list: List[torch.Tensor],
+    bases: List[str] = BASES,
+    blank_index: int = BLANK_INDEX,
+) -> List[str]:
+    """将 PyTorch 标签张量列表转换为碱基字符串列表
+    
+    使用字节数组查表加速字符串拼接。
+    
+    Args:
+        labels_list: 标签张量列表
+        bases: 碱基列表
+        blank_index: 空白符索引
+        
+    Returns:
+        DNA 字符串列表
+    """
+    base_chars = [b.encode("ascii") for b in bases]
+    results = []
+
+    for labels in labels_list:
+        labels_np = labels.cpu().numpy()
+        if len(labels_np) == 0:
+            results.append("")
+            continue
+
+        buf = bytearray(len(labels_np))
+        for i, lbl in enumerate(labels_np):
+            if lbl < len(base_chars):
+                buf[i] = base_chars[int(lbl)][0]
+            else:
+                buf[i] = ord("N")
+
+        results.append(buf.decode("ascii"))
+
+    return results
+
+
+def padded_labels_to_strings(
+    padded_labels: torch.Tensor,
+    label_lengths: torch.Tensor,
+    bases: List[str] = BASES,
+) -> List[str]:
+    """将填充的标签矩阵转换为碱基字符串列表
+    
+    完全向量化的字符串转换。
+    
+    Args:
+        padded_labels: (B, L) 填充的标签矩阵
+        label_lengths: (B,) 各序列的有效长度
+        bases: 碱基列表
+        
+    Returns:
+        DNA 字符串列表
+    """
+    labels_np = padded_labels.cpu().numpy()
+    lengths_np = label_lengths.cpu().numpy()
+    B = labels_np.shape[0]
+
+    base_bytes = np.array([ord(b) for b in bases], dtype=np.uint8)
+
+    results = []
+    for b in range(B):
+        n = int(lengths_np[b])
+        if n == 0:
+            results.append("")
+            continue
+        lbls = labels_np[b, :n]
+        chars = base_bytes[lbls]
+        results.append(chars.tobytes().decode("ascii"))
+
+    return results
+
+
 def labels_to_bases(labels: np.ndarray) -> str:
     """将整数标签序列转换为碱基字符串
     
