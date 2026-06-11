@@ -11,6 +11,11 @@ from .signal.denoiser import SignalDenoiser
 from .model.basecaller_net import BasecallerNet
 from .decoding.ctc_decoder import CTCGreedyDecoder
 from .pipeline.basecall_pipeline import BasecallPipeline
+from .assembly.kmer_util import KmerUtil
+from .assembly.de_bruijn_graph import DeBruijnGraph
+from .assembly.graph_simplifier import GraphSimplifier
+from .assembly.eulerian_path import EulerianPathAssembler, Contig, AssemblyStats
+from .assembly.assembler import DeNovoAssembler, AssemblyResult
 
 __all__ = [
     "Fast5Reader",
@@ -20,4 +25,12 @@ __all__ = [
     "BasecallerNet",
     "CTCGreedyDecoder",
     "BasecallPipeline",
+    "KmerUtil",
+    "DeBruijnGraph",
+    "GraphSimplifier",
+    "EulerianPathAssembler",
+    "Contig",
+    "AssemblyStats",
+    "DeNovoAssembler",
+    "AssemblyResult",
 ]
